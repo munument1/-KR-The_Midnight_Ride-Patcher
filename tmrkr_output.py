@@ -88,8 +88,9 @@ def _translate_interface(source: Path, mapping_path: Path, output: Path) -> dict
             matched += 1
             out.append(key + "\t" + translated + newline)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text("".join(out), encoding="utf-8")
-    return {"matched": matched, "missing": len(missing)}
+    # Interface translation tables require UTF-16 LE with a BOM.
+    output.write_bytes(b"\xff\xfe" + "".join(out).encode("utf-16-le"))
+    return {"matched": matched, "missing": len(missing), "encoding": "utf-16-le"}
 
 
 def _copy_en_sidecars(source_dir: Path, target_strings: Path) -> int:
@@ -111,6 +112,21 @@ def _plugin_map(catalog_dir: Path, entry: dict) -> Path | None:
         return None
     path = _contained(catalog_dir, rel)
     return path if path.is_file() else None
+
+
+def _verified_exact_payload(catalog_dir: Path, entry: dict) -> Path | None:
+    # Legacy releases lost Korean text at serialization. Only payloads created
+    # by the UTF-8 backend and checked by a text roundtrip may bypass translation.
+    if (entry.get("payload_encoding") != "utf-8"
+            or entry.get("text_roundtrip_verified") is not True
+            or not entry.get("payload")):
+        return None
+    payload = _contained(catalog_dir, entry["payload"])
+    if not payload.is_file():
+        return None
+    if tmrkr.sha256(payload) != entry.get("payload_sha256"):
+        raise ValueError(f"Payload hash mismatch: {entry.get('name', payload.name)}")
+    return payload
 
 
 def _run_fallback(source: Path, plugin: str, entry: dict | None,
@@ -220,10 +236,8 @@ def build_output(mo2_root: Path, base_package: Path, catalog_dir: Path,
             }
 
             if entry and source_hash == entry.get("source_sha256"):
-                if entry.get("baseline_status") == "translated" and entry.get("payload"):
-                    payload = _contained(catalog_dir, entry["payload"])
-                    if tmrkr.sha256(payload) != entry["payload_sha256"]:
-                        raise ValueError(f"Payload hash mismatch: {plugin}")
+                payload = _verified_exact_payload(catalog_dir, entry)
+                if entry.get("baseline_status") == "translated" and payload is not None:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(payload, target)
                     sidecars = 0
@@ -232,10 +246,15 @@ def build_output(mo2_root: Path, base_package: Path, catalog_dir: Path,
                             _contained(catalog_dir, entry["sidecar_dir"]),
                             target.parent / "Strings")
                     result.update(status="exact_payload", changed=entry.get("changed", 0), sidecars=sidecars)
-                else:
+                    report["plugins"].append(result)
+                    continue
+                elif entry.get("baseline_status") != "translated":
                     result.update(status="known_no_translation_needed", changed=0)
-                report["plugins"].append(result)
-                continue
+                    report["plugins"].append(result)
+                    continue
+
+                # A missing or unverified exact payload must use direct/fallback,
+                # even when the original plugin's hash is a catalog match.
 
             detail, translated = _run_fallback(source, plugin, entry, catalog_dir, temp)
             if translated is None or detail.get("status") == "no_changes":

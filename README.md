@@ -75,12 +75,22 @@ Interface:
 
 ## 번역 적용 우선순위
 
-1. 현재 검증 버전과 해시가 일치하면 검증된 exact payload 사용
+1. 현재 버전과 입력 해시가 일치하고, UTF-8 저장 및 텍스트 재읽기 검증이 기록된 exact payload 사용
 2. 모드 전용 direct 번역 사전
 3. Fallout 4 본편/공식 DLC의 동일 레코드 번역 상속
 4. 안전하게 매칭되지 않는 문자열은 변경하지 않음
 
 Fallback은 현재 영문 원문까지 확인하므로, 모드가 의도적으로 문구를 바꾼 경우 과거 바닐라 번역을 강제로 덮어쓰지 않습니다.
+
+검증 정보가 없는 기존 exact payload나 누락된 파일은 사용하지 않고 direct/fallback 사전으로 처리합니다. `exact payload 41개`와 `direct 사전 17개`는 서로 겹치는 목록이며, direct 사전이 없는 플러그인도 원본 게임/DLC fallback 사전으로 번역할 수 있습니다.
+
+## 한국어 저장 형식 및 기존 손상 파일
+
+ESP/ESM의 번역 문자열과 localized 플러그인의 `_en.STRINGS` 파일은 UTF-8로 저장합니다. `Interface/Translations/*_en.txt`는 UTF-16 LE(BOM 포함)로 저장합니다. 입력 영문 파일의 CP1252 특수문자는 읽을 때 보존하며, 제작용 메모·식별자 등 비번역 필드는 번역하지 않습니다.
+
+저장 후 변경된 문자열을 다시 읽어 기대한 번역과 일치하는지 검사합니다. 이미 `???`가 저장된 설치 파일은 깨끗한 영문 원본으로 복구한 뒤 Output을 다시 생성해야 합니다. `direct-maps`에 없는 플러그인도 fallback 적용 대상이므로 복구 범위를 이 폴더의 파일 이름만으로 판단하지 마세요.
+
+개발자용 재현·테스트 방법과 payload 재생성 정책은 [번역 인코딩 문서](docs/translation-encoding.md)를 참고하세요.
 
 ## MCM / Interface
 

@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Text.Json;
 using Mutagen.Bethesda.Fallout4;
 using Mutagen.Bethesda.Plugins;
+using Mutagen.Bethesda.Plugins.Binary.Parameters;
 using Mutagen.Bethesda.Strings;
 
 internal static class Program
@@ -112,7 +113,8 @@ internal static class Program
         var output = Path.GetFullPath(args[1]);
         var keysOnly = args.Length == 3 && args[2] == "--keys-only";
         var modKey = ModKey.FromFileName(Path.GetFileName(input));
-        var mod = Fallout4Mod.CreateFromBinary(new ModPath(modKey, input), Fallout4Release.Fallout4);
+        var mod = Fallout4Mod.CreateFromBinary(new ModPath(modKey, input), Fallout4Release.Fallout4,
+            new BinaryReadParameters { StringsParam = TranslationEncoding.Read() });
 
         var rows = new List<Row>();
         if (!keysOnly)

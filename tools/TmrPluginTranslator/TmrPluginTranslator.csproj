@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="Mutagen.Bethesda.Fallout4" Version="0.54.4" />
+    <Compile Include="../Shared/TranslationEncoding.cs" Link="TranslationEncoding.cs" />
   </ItemGroup>
 
 </Project>

@@ -1,8 +1,11 @@
 using System.Collections;
 using System.Reflection;
 using System.Text.Json;
+using Mutagen.Bethesda;
 using Mutagen.Bethesda.Fallout4;
 using Mutagen.Bethesda.Plugins;
+using Mutagen.Bethesda.Plugins.Binary.Parameters;
+using Mutagen.Bethesda.Plugins.Binary.Streams;
 using Mutagen.Bethesda.Strings;
 
 internal static class Program
@@ -56,6 +59,79 @@ internal static class Program
     }
 
     private static readonly Dictionary<Type, PropertyInfo[]> PropertyCache = new();
+    private static readonly Dictionary<FormKey, Dictionary<string, string>> ExpectedTexts = new();
+
+    private static Dictionary<string, string> SnapshotTexts(object record)
+    {
+        var texts = new Dictionary<string, string>(StringComparer.Ordinal);
+        CollectTexts(record, "", texts, new HashSet<object>(ReferenceEqualityComparer.Instance));
+        return texts;
+    }
+
+    private static void CollectTexts(object? obj, string path, Dictionary<string, string> texts,
+        HashSet<object> visited, int depth = 0)
+    {
+        if (obj is null || depth > 20) return;
+        if (obj is string text)
+        {
+            texts[path] = text;
+            return;
+        }
+        if (obj is TranslatedString translated)
+        {
+            if (translated.String is { } value) texts[path] = value;
+            return;
+        }
+        var type = obj.GetType();
+        if (!type.IsValueType && !visited.Add(obj)) return;
+        if (obj is IEnumerable enumerable && type != typeof(byte[]))
+        {
+            var index = 0;
+            foreach (var item in enumerable)
+                CollectTexts(item, $"{path}[{index++}]", texts, visited, depth + 1);
+            return;
+        }
+        if (!IsFallout4Object(type)) return;
+        foreach (var property in GetReadableProperties(type))
+        {
+            object? value;
+            try { value = property.GetValue(obj); }
+            catch { continue; }
+            if (value is null) continue;
+            if (value is string or TranslatedString || ShouldRecurse(value.GetType()))
+                CollectTexts(value, string.IsNullOrEmpty(path) ? property.Name : path + "." + property.Name,
+                    texts, visited, depth + 1);
+        }
+    }
+
+    private static void RecordTextChanges(Mutagen.Bethesda.Plugins.Records.IMajorRecord record,
+        Dictionary<string, string> before)
+    {
+        foreach (var pair in SnapshotTexts(record))
+        {
+            if (before.TryGetValue(pair.Key, out var original) && original == pair.Value) continue;
+            if (!ExpectedTexts.TryGetValue(record.FormKey, out var expected))
+                ExpectedTexts[record.FormKey] = expected = new(StringComparer.Ordinal);
+            expected[pair.Key] = pair.Value;
+        }
+    }
+
+    private static int VerifyTexts(
+        IReadOnlyDictionary<FormKey, Mutagen.Bethesda.Plugins.Records.IMajorRecord> records)
+    {
+        var verified = 0;
+        foreach (var record in ExpectedTexts)
+        {
+            var actual = SnapshotTexts(records[record.Key]);
+            foreach (var pair in record.Value)
+            {
+                if (!actual.TryGetValue(pair.Key, out var value) || value != pair.Value)
+                    throw new InvalidDataException($"Saved translation mismatch: {record.Key} {pair.Key}");
+                verified++;
+            }
+        }
+        return verified;
+    }
 
     private static bool IsFallout4Object(Type type)
     {
@@ -119,17 +195,7 @@ internal static class Program
         {
             for (var i = 0; i < list.Count; i++)
             {
-                var item = list[i];
-                if (item is string s && replacements.TryGetValue(s, out var dest) && dest != s && !list.IsReadOnly)
-                {
-                    list[i] = dest;
-                    hits[s] = hits.GetValueOrDefault(s) + 1;
-                    changed++;
-                }
-                else
-                {
-                    changed += ReplaceStrings(item, replacements, hits, visited, depth + 1);
-                }
+                changed += ReplaceStrings(list[i], replacements, hits, visited, depth + 1);
             }
             return changed;
         }
@@ -156,18 +222,9 @@ internal static class Program
 
             if (property.PropertyType == typeof(string))
             {
-                if (!property.CanWrite) continue;
-                var s = (string)value;
-                if (replacements.TryGetValue(s, out var dest) && dest != s)
-                {
-                    try
-                    {
-                        property.SetValue(obj, dest);
-                        hits[s] = hits.GetValueOrDefault(s) + 1;
-                        changed++;
-                    }
-                    catch { }
-                }
+                // Plain strings include NAM2 ScriptNotes, filenames and script
+                // metadata. Matching a dialogue's source text does not make
+                // these fields translatable; they retain their original bytes.
                 continue;
             }
 
@@ -199,12 +256,7 @@ internal static class Program
     {
         if (obj is null || depth > 20) return;
 
-        if (obj is string direct)
-        {
-            if (wanted.Contains(direct))
-                counts[direct] = counts.GetValueOrDefault(direct) + 1;
-            return;
-        }
+        if (obj is string) return;
 
         if (obj is TranslatedString translated)
         {
@@ -235,12 +287,7 @@ internal static class Program
             catch { continue; }
             if (value is null) continue;
 
-            if (value is string text)
-            {
-                if (wanted.Contains(text))
-                    counts[text] = counts.GetValueOrDefault(text) + 1;
-                continue;
-            }
+            if (value is string) continue;
 
             if (value is TranslatedString ts)
             {
@@ -510,6 +557,7 @@ internal static class Program
             }
 
             var record = candidates[0];
+            var before = SnapshotTexts(record);
             stats.RecordsConsidered++;
             var replacements = BuildReplacements(group, true, record.FormKey, stats, strictAmbiguous);
             var hits = replacements.Keys.ToDictionary(x => x, _ => 0, StringComparer.Ordinal);
@@ -518,6 +566,7 @@ internal static class Program
                 replacements,
                 hits,
                 new HashSet<object>(ReferenceEqualityComparer.Instance));
+            RecordTextChanges(record, before);
 
             foreach (var pair in hits)
             {
@@ -581,6 +630,7 @@ internal static class Program
 
             if (directGroup.Length > 0) directStats.RecordsConsidered++;
             if (fallbackGroup.Length > 0) fallbackStats.RecordsConsidered++;
+            var before = SnapshotTexts(record);
 
             // QUST/TERM have repeated field arrays where identical English text can
             // legitimately map to different translations. Match those exactly by
@@ -603,7 +653,11 @@ internal static class Program
             foreach (var pair in fallbackReplacements)
                 combined[pair.Key] = pair.Value;
 
-            if (combined.Count == 0) continue;
+            if (combined.Count == 0)
+            {
+                RecordTextChanges(record, before);
+                continue;
+            }
 
             var hits = combined.Keys.ToDictionary(x => x, _ => 0, StringComparer.Ordinal);
             ReplaceStrings(
@@ -611,6 +665,7 @@ internal static class Program
                 combined,
                 hits,
                 new HashSet<object>(ReferenceEqualityComparer.Instance));
+            RecordTextChanges(record, before);
 
             foreach (var source in directReplacements.Keys)
             {
@@ -678,7 +733,8 @@ internal static class Program
 
         var mod = Fallout4Mod.CreateFromBinary(
             new ModPath(modKey, input),
-            Fallout4Release.Fallout4);
+            Fallout4Release.Fallout4,
+            new BinaryReadParameters { StringsParam = TranslationEncoding.Read() });
 
         var inputMasters = mod.ModHeader.MasterReferences.Select(x => x.Master).ToArray();
         var records = mod.EnumerateMajorRecords().ToDictionary(x => x.FormKey);
@@ -766,18 +822,32 @@ internal static class Program
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
         if (File.Exists(output)) File.Delete(output);
 
-        await mod.BeginWrite
+        var writer = mod.BeginWrite
             .ToPath(output)
             .WithLoadOrderFromHeaderMasters()
             .WithNoDataFolder()
+            .WithEmbeddedEncodings(new EncodingBundle(
+                Mutagen.Bethesda.Strings.DI.MutagenEncoding._1252, TranslationEncoding.Utf8))
             .WithExplicitOverridingMasterList(inputMasters)
             .WithMastersListOrdering(inputMasters)
-            .NoMastersListContentCheck()
-            .WriteAsync();
+            .NoMastersListContentCheck();
+
+        // Localized plugins also need UTF-8 in their _en STRINGS sidecars.
+        if ((Convert.ToUInt32(mod.ModHeader.Flags) & 0x80) != 0)
+        {
+            using var stringsWriter = new StringsWriter(GameRelease.Fallout4, modKey,
+                Path.Combine(Path.GetDirectoryName(output)!, "Strings"), TranslationEncoding.OutputProvider);
+            await writer.WithStringsWriter(stringsWriter).WriteAsync();
+        }
+        else
+        {
+            await writer.WriteAsync();
+        }
 
         var verify = Fallout4Mod.CreateFromBinary(
             new ModPath(modKey, output),
-            Fallout4Release.Fallout4);
+            Fallout4Release.Fallout4,
+            new BinaryReadParameters { StringsParam = TranslationEncoding.Read(output: true) });
 
         var verifyMasters = verify.ModHeader.MasterReferences.Select(x => x.Master).ToArray();
         if (!inputMasters.SequenceEqual(verifyMasters))
@@ -791,6 +861,8 @@ internal static class Program
         foreach (var key in records.Keys)
             if (!verifyRecords.ContainsKey(key))
                 throw new InvalidDataException($"Fresh read missing record: {key}");
+
+        var verifiedStrings = VerifyTexts(verifyRecords);
 
         Console.WriteLine(JsonSerializer.Serialize(new {
             status = "translated",
@@ -807,7 +879,10 @@ internal static class Program
             unmatched_direct = unmatched.Count,
             unmatched_direct_examples = unmatched.Take(20).ToArray(),
             master_order_preserved = true,
-            fresh_read = true
+            fresh_read = true,
+            text_roundtrip_verified = true,
+            verified_strings = verifiedStrings,
+            translation_encoding = "utf-8"
         }));
         return 0;
     }

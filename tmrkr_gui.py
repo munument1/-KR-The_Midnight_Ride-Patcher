@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import queue
@@ -119,7 +120,7 @@ class App:
                     x["status"] in {"known_no_translation_needed", "updated_no_match", "new_no_match", "excluded"}
                     for x in report["plugins"])
                 self.status.set(
-                    f"완료: 빠른 적용 {exact} · 업데이트/신규 상속 {fallback} · "
+                    f"완료: 빠른 적용 {exact} · 사전 번역 {fallback} · "
                     f"번역 불필요/대응 없음 {skipped}\n"
                     f"MCM {len(report['mcm'])}개 · Interface {len(report['interface'])}개\n"
                     f"{target}\n"
@@ -135,6 +136,9 @@ class App:
 
 
 def packaged_self_test(mo2_root: str) -> int:
+    # Initialize Tcl without opening a window; packaging can omit its resources
+    # even when importing tkinter succeeds.
+    tk.Tcl().eval("info patchlevel")
     folder = program_folder()
     data = folder / "TranslationData"
     base = folder / BUNDLED_BASE
@@ -151,10 +155,29 @@ def packaged_self_test(mo2_root: str) -> int:
             raise RuntimeError("Output self-test failed")
         if not (output / "mods" / BASE_MOD / "Strings").is_dir():
             raise RuntimeError("FO4 KOREAN MO2 mod was not generated")
-        if not any(x["status"] == "exact_payload" for x in report["plugins"]):
-            raise RuntimeError("Exact payload path was not exercised")
+        if not any(x["status"] == "exact_payload"
+                   or x.get("detail", {}).get("text_roundtrip_verified") is True
+                   for x in report["plugins"]):
+            raise RuntimeError("No verified plugin translation was generated")
+        entries = {row["name"].casefold(): row for row in
+                   json.loads((data / "catalog.json").read_text(encoding="utf-8-sig"))["plugins"]}
+        for item in report["plugins"]:
+            if item["status"] == "exact_payload":
+                entry = entries[item["plugin"].casefold()]
+                if (entry.get("payload_encoding") != "utf-8"
+                        or entry.get("text_roundtrip_verified") is not True):
+                    raise RuntimeError("Unverified exact payload was used")
         if report["base_files"] < 1:
             raise RuntimeError("Bundled Korean resource path was not exercised")
+        for item in report["interface"]:
+            provider = item["provider"]
+            target_root = (output / "overwrite" if provider == "MO2:overwrite"
+                           else output / "mods" / (BASE_MOD if provider == "game:Data" else provider))
+            translation = target_root / item["path"]
+            raw = translation.read_bytes()
+            if not raw.startswith(b"\xff\xfe"):
+                raise RuntimeError(f"Interface translation is not UTF-16 LE: {item['path']}")
+            raw[2:].decode("utf-16-le", errors="strict")
         generated_names = {p.name.casefold() for p in output.rglob("*") if p.is_file()}
         for excluded in ("ptrfo4001_t60pistol.esl", "ptrfo4002_vangraff.esl"):
             if excluded in generated_names:
@@ -164,7 +187,13 @@ def packaged_self_test(mo2_root: str) -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
-        raise SystemExit(packaged_self_test(sys.argv[2]))
+        try:
+            result = packaged_self_test(sys.argv[2])
+        except Exception:
+            import traceback
+            (program_folder() / "self-test-error.log").write_text(traceback.format_exc(), encoding="utf-8")
+            raise SystemExit(1)
+        raise SystemExit(result)
     window = tk.Tk()
     App(window)
     window.mainloop()

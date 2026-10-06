@@ -114,12 +114,18 @@ def main() -> int:
 
         payload_source = args.final_build / "plugins" / plugin
         if row["status"] == "translated" and payload_source.is_file():
+            detail = row.get("detail", {})
+            if (detail.get("translation_encoding") != "utf-8"
+                    or detail.get("text_roundtrip_verified") is not True):
+                raise ValueError(f"Refusing unverified translation payload: {plugin}")
             payload_rel = Path("exact-plugins") / plugin
             payload_target = out / payload_rel
             payload_target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(payload_source, payload_target)
             entry["payload"] = payload_rel.as_posix()
             entry["payload_sha256"] = tmrkr.sha256(payload_target)
+            entry["payload_encoding"] = "utf-8"
+            entry["text_roundtrip_verified"] = True
             entry["changed"] = row.get("detail", {}).get("changed", 0)
             sidecar = copy_exact_sidecars(plugin, args.final_build / "plugins", out)
             if sidecar:

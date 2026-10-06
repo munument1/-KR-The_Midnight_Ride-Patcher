@@ -47,12 +47,13 @@ def translate_interface_file(source: Path, sst_path: Path, output: Path) -> dict
         out_lines.append(key + "\t" + translated + newline)
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    # Fallout 4 is run as English; keep the _en filename but store Korean text in UTF-8.
-    output.write_text("".join(out_lines), encoding="utf-8")
+    # Keep the _en filename; Interface translation tables use UTF-16 LE with a BOM.
+    output.write_bytes(b"\xff\xfe" + "".join(out_lines).encode("utf-16-le"))
     return {
         "source": str(source),
         "sst": str(sst_path),
         "output": str(output),
+        "encoding": "utf-16-le",
         "sst_format": sst.format,
         "sst_entries": len(sst.entries),
         "mapping_entries": len(mapping),
