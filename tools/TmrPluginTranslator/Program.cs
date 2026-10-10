@@ -1,6 +1,8 @@
 using System.Collections;
 using System.Reflection;
 using System.Text.Json;
+using System.Text;
+using Mutagen.Bethesda.Plugins.Binary.Parameters;
 using Mutagen.Bethesda.Fallout4;
 using Mutagen.Bethesda.Plugins;
 using Mutagen.Bethesda.Strings;
@@ -229,7 +231,6 @@ internal static class Program
 
         foreach (var property in GetReadableProperties(type))
         {
-
             object? value;
             try { value = property.GetValue(obj); }
             catch { continue; }
@@ -653,6 +654,20 @@ internal static class Program
         var directPathArg = args[1];
         var fallbackPath = args.Length == 4 ? Path.GetFullPath(args[2]) : null;
         var output = Path.GetFullPath(args.Length == 4 ? args[3] : args[2]);
+        if (string.Equals(input, output, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("Input and output paths must differ");
+
+        try { WorldIndexStripper.ValidateInput(input); }
+        catch (NotSupportedException exc)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new {
+                status = "skipped_unsafe_offsets",
+                input,
+                changed = 0,
+                reason = exc.Message
+            }));
+            return 0;
+        }
 
         MappingFile mapping;
         if (directPathArg == "-")
@@ -676,12 +691,46 @@ internal static class Program
         if (!string.Equals(modKey.FileName, mapping.target, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException($"Mapping target {mapping.target} does not match {modKey}");
 
+        // Localized fields contain string-table IDs rather than inline text.
+        // Do not turn these into inline strings or reuse an old serialized payload.
+        using (var stream = File.OpenRead(input))
+        using (var reader = new BinaryReader(stream))
+        {
+            stream.Position = 8;
+            if ((reader.ReadUInt32() & 0x80) != 0)
+            {
+                Console.WriteLine(JsonSerializer.Serialize(new {
+                    status = "skipped_localized_strings",
+                    input,
+                    changed = 0,
+                    reason = "Localized string-table plugins require separate validated sidecar translation; original preserved."
+                }));
+                return 0;
+            }
+        }
+
+        var utf8Read = new BinaryReadParameters {
+            StringsParam = new StringsReadParameters {
+                NonLocalizedEncodingOverride = new MutagenEncodingWrapper(Encoding.UTF8)
+            }
+        };
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        var sourceRead = new BinaryReadParameters {
+            StringsParam = new StringsReadParameters {
+                NonLocalizedEncodingOverride = new MutagenEncodingFallbackWrapper(
+                    new MutagenEncodingWrapper(new UTF8Encoding(false, true)),
+                    new MutagenEncodingWrapper(Encoding.GetEncoding(1252)))
+            }
+        };
         var mod = Fallout4Mod.CreateFromBinary(
             new ModPath(modKey, input),
-            Fallout4Release.Fallout4);
+            Fallout4Release.Fallout4, sourceRead);
 
         var inputMasters = mod.ModHeader.MasterReferences.Select(x => x.Master).ToArray();
         var records = mod.EnumerateMajorRecords().ToDictionary(x => x.FormKey);
+        var eligibleRecords = records.Where(x => !TranslationSafety.IsProtected(x.Value))
+            .ToDictionary(x => x.Key, x => x.Value);
+        var protectedRecords = records.Count - eligibleRecords.Count;
         var missingRecords = new List<string>();
         var unmatched = new List<object>();
         var ambiguous = new List<object>();
@@ -722,12 +771,12 @@ internal static class Program
         var normalFallback = fallbackRows.Where(x => x.id != "000000").ToArray();
 
         var zeroDirectStats = ApplyZeroDirectRows(
-            zeroDirect, records, missingRecords, unmatched, ambiguous);
+            zeroDirect, eligibleRecords, missingRecords, unmatched, ambiguous);
 
         var combinedStats = ApplyCombinedNormalRows(
             normalDirect,
             normalFallback,
-            records,
+            eligibleRecords,
             missingRecords,
             unmatched,
             ambiguous);
@@ -749,6 +798,8 @@ internal static class Program
         {
             Console.WriteLine(JsonSerializer.Serialize(new {
                 status = "no_changes",
+                plugin_policy_version = TranslationSafety.PolicyVersion,
+                protected_records = protectedRecords,
                 input,
                 target = mapping.target,
                 records = records.Count,
@@ -766,18 +817,46 @@ internal static class Program
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
         if (File.Exists(output)) File.Delete(output);
 
-        await mod.BeginWrite
-            .ToPath(output)
-            .WithLoadOrderFromHeaderMasters()
-            .WithNoDataFolder()
-            .WithExplicitOverridingMasterList(inputMasters)
-            .WithMastersListOrdering(inputMasters)
-            .NoMastersListContentCheck()
-            .WriteAsync();
+        var scratch = Path.Combine(Path.GetDirectoryName(output)!, ".serialize-" + Guid.NewGuid().ToString("N"));
+        var baselinePath = Path.Combine(scratch, "baseline", Path.GetFileName(input));
+        var translatedPath = Path.Combine(scratch, "translated", Path.GetFileName(input));
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(baselinePath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(translatedPath)!);
+            var originalMod = Fallout4Mod.CreateFromBinary(
+                new ModPath(modKey, input), Fallout4Release.Fallout4, sourceRead);
+            await originalMod.BeginWrite.ToPath(baselinePath)
+                .WithLoadOrderFromHeaderMasters().WithNoDataFolder().WithUtf8Encoding()
+                .WithExplicitOverridingMasterList(inputMasters).WithMastersListOrdering(inputMasters)
+                .NoMastersListContentCheck().WriteAsync();
+            await mod.BeginWrite.ToPath(translatedPath)
+                .WithLoadOrderFromHeaderMasters().WithNoDataFolder().WithUtf8Encoding()
+                .WithExplicitOverridingMasterList(inputMasters).WithMastersListOrdering(inputMasters)
+                .NoMastersListContentCheck().WriteAsync();
+            totalChanged = OriginalTextWriter.Write(input, baselinePath, translatedPath,
+                directRows.Concat(fallbackRows).Select(x =>
+                    new OriginalTextWriter.Pair(x.record, x.field, x.source, x.dest)),
+                totalChanged, output);
+        }
+        finally
+        {
+            if (File.Exists(baselinePath)) File.Delete(baselinePath);
+            if (File.Exists(translatedPath)) File.Delete(translatedPath);
+            Directory.Delete(scratch, true);
+        }
+
+        WorldIndexStripper.Result strippedIndexes;
+        try { strippedIndexes = WorldIndexStripper.StripAndVerify(output); }
+        catch
+        {
+            File.Delete(output);
+            throw;
+        }
 
         var verify = Fallout4Mod.CreateFromBinary(
             new ModPath(modKey, output),
-            Fallout4Release.Fallout4);
+            Fallout4Release.Fallout4, utf8Read);
 
         var verifyMasters = verify.ModHeader.MasterReferences.Select(x => x.Master).ToArray();
         if (!inputMasters.SequenceEqual(verifyMasters))
@@ -792,8 +871,18 @@ internal static class Program
             if (!verifyRecords.ContainsKey(key))
                 throw new InvalidDataException($"Fresh read missing record: {key}");
 
+        // OriginalTextWriter checks complete source/destination bytes for every
+        // emitted display field. Generic object-only changes (e.g. actor notes)
+        // are intentionally not emitted and must not be expected on fresh read.
+
         Console.WriteLine(JsonSerializer.Serialize(new {
             status = "translated",
+            plugin_policy_version = TranslationSafety.PolicyVersion,
+            protected_records = protectedRecords,
+            utf8_text_verified = true,
+            original_bytes_preserved = true,
+            world_indexes_removed = strippedIndexes,
+            world_indexes_absent_verified = true,
             input,
             output,
             target = mapping.target,

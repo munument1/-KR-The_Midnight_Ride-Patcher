@@ -151,8 +151,8 @@ def packaged_self_test(mo2_root: str) -> int:
             raise RuntimeError("Output self-test failed")
         if not (output / "mods" / BASE_MOD / "Strings").is_dir():
             raise RuntimeError("FO4 KOREAN MO2 mod was not generated")
-        if not any(x["status"] == "exact_payload" for x in report["plugins"]):
-            raise RuntimeError("Exact payload path was not exercised")
+        if not any(x["status"] in ("exact_payload", "updated_fallback") for x in report["plugins"]):
+            raise RuntimeError("Neither a current payload nor binary-preserving fallback was exercised")
         if report["base_files"] < 1:
             raise RuntimeError("Bundled Korean resource path was not exercised")
         generated_names = {p.name.casefold() for p in output.rglob("*") if p.is_file()}

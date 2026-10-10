@@ -10,7 +10,7 @@ from tmrkr_mcm import translate_mcm_json
 
 class OutputTests(unittest.TestCase):
     def test_release_version(self):
-        self.assertEqual(tmrkr.VERSION, "1.0.1")
+        self.assertEqual(tmrkr.VERSION, "1.0.2")
 
     def test_removed_ptr_plugins_stay_excluded(self):
         self.assertIn("ptrfo4001_t60pistol.esl", EXCLUDED_PLUGINS)

@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import tmrkr
+from tmrkr_plugin_safety import plugin_skip_reason, PLUGIN_POLICY_VERSION, offset_tables
 from tmrkr_sst import read_sst, custom_text_mapping
 
 
@@ -105,15 +106,24 @@ def main() -> int:
             continue
 
         source = installation.source(plugin)
+        # Inspect originals even when packaging artifacts from an older backend.
+        if plugin_skip_reason(source):
+            print(f"SKIP {plugin}: unsafe TES4/WRLD OFST")
+            continue
         row = result_by_name.get(lower, {"status": "no_applicable_mapping"})
         entry = {
             "name": plugin,
             "source_sha256": tmrkr.sha256(source),
             "baseline_status": row["status"],
+            "plugin_policy_version": row.get("detail", {}).get("plugin_policy_version"),
         }
 
         payload_source = args.final_build / "plugins" / plugin
         if row["status"] == "translated" and payload_source.is_file():
+            if entry["plugin_policy_version"] != PLUGIN_POLICY_VERSION:
+                raise ValueError(f"Outdated payload: {plugin}; rebuild with current backend")
+            if offset_tables(payload_source):
+                raise ValueError(f"Unstripped world-index payload: {plugin}")
             payload_rel = Path("exact-plugins") / plugin
             payload_target = out / payload_rel
             payload_target.parent.mkdir(parents=True, exist_ok=True)

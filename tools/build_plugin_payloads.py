@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
 import tmrkr
+from tmrkr_plugin_safety import plugin_skip_reason
 from export_plugin_sst import export_sst
 from inventory_translation_sources import files_by_norm, find_sst
 
@@ -109,6 +110,15 @@ def main() -> int:
         except Exception as exc:
             results.append({"plugin": plugin, "status": "source_error", "error": repr(exc)})
             print(f"ERROR source {plugin}: {exc}")
+            continue
+
+        try:
+            reason = plugin_skip_reason(source)
+        except ValueError as exc:
+            reason = f"Safety preflight failed: {exc}"
+        if reason:
+            results.append({"plugin": plugin, "status": "skipped_unsafe_plugin", "reason": reason})
+            print(f"SKIP {plugin}: {reason}")
             continue
 
         scan_path = scans_dir / f"{Path(plugin).name}.json"
@@ -206,6 +216,11 @@ def main() -> int:
                     "stdout": run.stdout[-4000:],
                 })
                 print(f"FAIL {plugin}: {run.stderr.splitlines()[-1] if run.stderr else run.returncode}")
+                continue
+
+            if detail.get("status", "").startswith("skipped_"):
+                results.append({"plugin": plugin, "status": detail["status"], "detail": detail})
+                print(f"SKIP {plugin}: {detail.get('reason', detail['status'])}")
                 continue
 
             if detail.get("status") == "no_changes":

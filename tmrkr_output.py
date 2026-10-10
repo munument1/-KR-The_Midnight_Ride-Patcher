@@ -10,6 +10,7 @@ import tempfile
 
 import tmrkr
 from tmrkr_mcm import translate_mcm_json
+from tmrkr_plugin_safety import plugin_skip_reason, PLUGIN_POLICY_VERSION, offset_tables
 
 OFFICIAL_MASTERS = {
     "fallout4.esm", "dlcrobot.esm", "dlcworkshop01.esm", "dlccoast.esm",
@@ -128,6 +129,9 @@ def _run_fallback(source: Path, plugin: str, entry: dict | None,
         raise RuntimeError(f"{plugin} fallback failed:\n{run.stderr[-4000:]}")
     lines = [x for x in run.stdout.splitlines() if x.strip()]
     detail = json.loads(lines[-1]) if lines else {}
+    if (not detail.get("status", "").startswith("skipped_")
+            and detail.get("plugin_policy_version") != PLUGIN_POLICY_VERSION):
+        raise RuntimeError(f"{plugin}: backend is outdated; rebuild TmrPluginTranslator.exe")
     return detail, output if output.is_file() else None
 
 
@@ -219,11 +223,24 @@ def build_output(mo2_root: Path, base_package: Path, catalog_dir: Path,
                 "relative_path": winner["path"],
             }
 
-            if entry and source_hash == entry.get("source_sha256"):
+            try:
+                reason = plugin_skip_reason(source)
+            except ValueError as exc:
+                reason = f"Safety preflight failed: {exc}"
+            if reason:
+                result.update(status="skipped_unsafe_plugin", changed=0, reason=reason)
+                report["plugins"].append(result)
+                report["warnings"].append(f"{plugin}: {reason}")
+                continue
+
+            if (entry and source_hash == entry.get("source_sha256")
+                    and entry.get("plugin_policy_version") == PLUGIN_POLICY_VERSION):
                 if entry.get("baseline_status") == "translated" and entry.get("payload"):
                     payload = _contained(catalog_dir, entry["payload"])
                     if tmrkr.sha256(payload) != entry["payload_sha256"]:
                         raise ValueError(f"Payload hash mismatch: {plugin}")
+                    if offset_tables(payload):
+                        raise ValueError(f"Unstripped world-index payload: {plugin}; rebuild release data")
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(payload, target)
                     sidecars = 0
@@ -238,7 +255,10 @@ def build_output(mo2_root: Path, base_package: Path, catalog_dir: Path,
                 continue
 
             detail, translated = _run_fallback(source, plugin, entry, catalog_dir, temp)
-            if translated is None or detail.get("status") == "no_changes":
+            if detail.get("status", "").startswith("skipped_"):
+                result.update(status=detail["status"], changed=0, detail=detail)
+                report["warnings"].append(f"{plugin}: {detail.get('reason', detail['status'])}")
+            elif translated is None or detail.get("status") == "no_changes":
                 result.update(status="updated_no_match" if entry else "new_no_match", changed=0, detail=detail)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
